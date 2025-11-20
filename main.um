@@ -1,0 +1,103 @@
+import (
+  "th.um"
+  "window.um"
+  "canvas.um"
+  "std.um"
+  gb = "gb.um"
+  "dbg.um"
+  "font.um"
+  "input.um"
+  "image.um"
+)
+
+var (
+  scale: int = 6
+  screenSize: th::Vf2 = {160, 144}
+  colors: [4]uint32 = {
+    0xCCDDCCFF,
+    0xAACCAAFF,
+    0x667766FF,
+    0x333333FF,
+  }
+  font: font::Font
+  frameNo: int
+  data: []uint32
+)
+
+fn init*() {
+  if std::argc() != 1 {
+    printf("usage: tophat <rom-path>")
+    exit(1)
+  }
+
+  var err: std::Err
+
+  font, err = font::load("unifont.otf", 16)
+  std::exitif(err)
+
+  romPath := std::argv(0)
+  file, err := std::fopen(std::argv(0), "rb")
+  std::exitif(err)
+  rom, err := std::freadall(file)
+  std::exitif(err)
+
+  gb := gb::mkGameboy([]uint8(rom))
+
+  gbFiber := make(fiber, |gb| {
+    gb::run(gb)
+  })
+
+  header := gb::readHeader(gb.rom)
+  printf("%v\n", header)
+
+  window::setup("CatBoy - "+header.title, trunc(screenSize.x*scale), trunc(screenSize.y*scale))
+  window::setViewport(screenSize)
+
+  image, err := image::mk(make([]uint32, 160*144), {160, 144})
+  std::exitif(err)
+  data = make([]uint32, 160*144)
+
+  window::onFrame.register(|image, gb, gbFiber| {
+    joyData := uint8(0)
+    if input::isPressed(.z) { joyData |= gb::JOY_B }
+    if input::isPressed(.x) { joyData |= gb::JOY_A }
+    if input::isPressed(.enter) { joyData |= gb::JOY_START }
+    if input::isPressed(.tab) { joyData |= gb::JOY_SELECT}
+    if input::isPressed(.up) { joyData |= gb::JOY_UP }
+    if input::isPressed(.down) { joyData |= gb::JOY_DOWN }
+    if input::isPressed(.left) { joyData |= gb::JOY_LEFT }
+    if input::isPressed(.right) { joyData |= gb::JOY_RIGHT }
+    gb.setJoy(joyData)
+
+    t := std::clock()
+    resume(gbFiber)
+    t2 := std::clock()-t
+    image.setData(gb.ppu.screen, {160, 144})
+    image.draw({s: {1, 1}})
+    
+    // dbg::renderDebugInfo(font, 
+    //   {
+    //     "frametime": sprintf("%gs", t2),
+    //     "frameNo": frameNo,
+    //   },
+    //   false,
+    //   0.2
+    // )
+
+    frameNo++
+  })
+
+  window::onDestroy.register(|gb| {
+    type Cnt = struct { opc: uint; cnt: uint; time: real; timeavg: real }
+    counts := []Cnt{}
+    for i, cnt in gb.counts {
+      counts = append(counts, {i, cnt.cnt, cnt.time, cnt.cnt>0 ? cnt.time/cnt.cnt : 0})
+    }
+
+    sort(counts, { return a.time < b.time ? 1 : 0 })
+
+    for i:=0; i<10; i++ {
+      printf("%03X : %d:%g(%g)\n", counts[i].opc, counts[i].cnt, counts[i].time, counts[i].timeavg)
+    }
+  })
+}

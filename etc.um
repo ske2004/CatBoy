@@ -1,0 +1,5 @@
+import ("std.um")
+
+fn u8toi8*(inp: uint8): int8 {
+  return inp>127 ? -(256-int(inp)) : inp
+}

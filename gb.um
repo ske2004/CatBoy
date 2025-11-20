@@ -1,0 +1,1610 @@
+// TODO:
+//  - scrolling
+//  - LYC
+//   y compare isn't possible with the stupid ppu right now
+//   it can also irq at different ppu x (3 points)
+//  - Music
+//   umi probably
+//  - VRAM dma
+//  - bank switching
+//  - Half carry is wrong (maybe)
+//  - a lot of other things
+
+import (
+  "std.um"
+  "etc.um"
+)
+
+const (
+  FLAG_Z = 0x80 // zero
+  FLAG_N = 0x40 // subtract
+  FLAG_H = 0x20 // half carry
+  FLAG_C = 0x10 // carry
+
+  IF_VBLANK = 0x01
+  IF_LCD    = 0x02
+  IF_TIMER  = 0x04
+  IF_SERIAL = 0x08
+  IF_JOY    = 0x10
+
+  JOY_A*      = 0x01
+  JOY_B*      = 0x02
+  JOY_SELECT* = 0x04
+  JOY_START*  = 0x08
+  JOY_RIGHT*  = 0x10
+  JOY_LEFT*   = 0x20
+  JOY_UP*     = 0x40
+  JOY_DOWN*   = 0x80
+
+  JOYSELECT_ALLS = 0x0
+  JOYSELECT_DPAD = 0x1
+  JOYSELECT_BTNS = 0x2
+  JOYSELECT_NONE = 0x3
+
+  LCDC_PPU_ENABLE    = 0x80
+  LCDC_WINDOW_SEL    = 0x40
+  LCDC_WINDOW_ENABLE = 0x20
+  LCDC_TILE_SEL      = 0x10
+  LCDC_BG_SEL        = 0x08
+  LCDC_OBJ_SIZE      = 0x04
+  LCDC_OBJ_ENABLE    = 0x02
+  LCDC_BG_ENABLE     = 0x01
+
+  debug = false
+)
+
+type (
+  ReadFn = fn (gb: weak ^Gameboy): uint8
+  WriteFn = fn (gb: weak ^Gameboy, value: uint8)
+
+  Header = struct {
+    title: str
+    cartType: uint8
+    romSize: uint8
+    ramSize: uint8
+  }
+
+  Register = enum {
+    af
+    bc
+    de
+    hl
+    sp
+    pc
+  }
+
+  CPU = struct {
+    // registers
+    regs: [6]uint16
+    ime: bool
+  }
+
+  Receiver = interface {
+    decode(gb: weak ^Gameboy)
+    fmt(gb: weak ^Gameboy): str // should be called after decode
+    read(gb: weak ^Gameboy): uint
+    write(gb: weak ^Gameboy, value: uint)
+  }
+
+  None        = struct {}
+  Const       = struct { ctx: uint16 }
+  Imm8        = struct { ctx: uint8 }
+  Rel8        = struct { ctx: uint8 }
+  Rel8SP      = struct { ctx: uint8 }
+  Imm16       = struct { ctx: uint16 }
+  Reg16       = struct { reg: Register }
+  RegHi       = struct { reg: Register }
+  RegLo       = struct { reg: Register }
+  DerefReg    = struct { reg: Register }
+  DerefRegLoH = struct { reg: Register }
+  DerefRegInc = struct { reg: Register }
+  DerefRegDec = struct { reg: Register }
+  Adr8H       = struct { ctx: uint16 }
+  Adr16       = struct { ctx: uint16 }
+
+  Handler = fn(gb: weak ^Gameboy, rxa, rxb: Receiver): void
+
+  OpcodeInfo = struct {
+    name: str
+    handler: Handler
+    cycles: int
+    a: Receiver
+    b: Receiver
+  }
+
+  PPU* = struct {
+    x: uint
+    y: uint
+    screen: [160*144]uint32
+    tileCache: [384][64]uint8
+    vram: [0x2000]uint8
+    oam: [0xA0+0x60]uint8 // padding for unmapped mem
+    oamdma: uint8
+    scx: uint8 // scroll x
+    scy: uint8 // scroll y
+    lcd: uint8 // lcd status
+    lcdc: uint8 // lcd control
+    lyc: uint8 // lcd y compare
+    bgp: uint8 // background pallete
+    bgp_p: [4]uint32 // background pallete (private)
+    o0p: uint8 // obj 0 pallete
+    o0p_p: [4]uint32 // obj0 pallete (private)
+    o1p: uint8 // obj 1 pallete
+    o1p_p: [4]uint32 // obj1 pallete (private)
+    tileMapperA: [256]uint16 // $8000 method
+    tileMapperB: [256]uint16 // $8800 method
+    activeTileMapper: weak^ [256]uint16
+    activeBgAddr: uint16
+    activeWindowAddr: uint16
+  }
+
+  Gameboy* = struct {
+    cpu: CPU
+    ppu: PPU
+    running: bool
+    cycles: int
+    jmpTable: [0x100]OpcodeInfo
+    jmpTable2: [0x100]OpcodeInfo
+
+    ram: [0x407F]uint8 
+    rom: []uint8
+
+    io_ie:  uint8 // interrupt enable flaglist
+    io_irq: uint8 // interrupt request flaglist
+    io_tima: uint8 // timer counter
+    io_tma: uint8 // timer modulo
+    io_tac: uint8 // timer control
+    io_joy: uint8
+
+    joyData: uint8
+
+    divCycles: uint
+    timerCycles: uint
+
+    counts: [0x200]struct{cnt: uint; time: real}
+  }
+)
+
+const (
+  REG_PC = int(Register.pc)
+  REG_SP = int(Register.sp)
+  REG_HL = int(Register.hl)
+  REG_AF = int(Register.af)
+)
+
+var (
+  ctlClocks  : [4]uint = {256, 4, 16, 64}
+  regNames   : []str = { "AF", "BC", "DE", "HL", "SP", "PC" }
+  regNamesHi : []str = { "A", "B", "D", "H", "S?", "P?" }
+  regNamesLo : []str = { "F", "C", "E", "L", "?P", "?C" }
+  start:    real
+  afReg: weak ^uint16
+  pcReg: weak ^uint16
+  colors: [4]uint32 = {
+    0xCCDDCCFF,
+    0xAACCAAFF,
+    0x667766FF,
+    0x333333FF,
+  }
+
+  memMapR: [0x10000]ReadFn  
+  memMapW: [0x10000]WriteFn
+)
+
+fn mapMemRgn(addr: uint16): (ReadFn, WriteFn) {
+  if addr >= 0x0000 && addr <= 0x7FFF {
+    return |addr| { // r
+      return gb.rom[addr]
+    }, |addr| {
+      // if debug { // w
+      //   printf("WARNING Write to ROM %04X\n", addr)
+      // }
+    }
+  } else if addr >= 0x8000 && addr <= 0x97FF {
+    baseAddr := addr-0x8000
+
+    return |baseAddr| { // r
+      return gb.ppu.vram[baseAddr]
+    }, |baseAddr| { // w
+      gb.ppu.vram[baseAddr] = value
+
+      tileId := baseAddr/16
+      sliceA := (baseAddr%16)/2*8
+      sliceB := sliceA+8
+
+      // christ
+      bit := uint8(baseAddr%2>0 ? 2 : 1)
+      for i:=sliceA; i<sliceB; i++ {
+        if (value & (1<<(7-(i-sliceA)))) > 0 {
+          gb.ppu.tileCache[tileId][i] |= bit
+        } else {
+          gb.ppu.tileCache[tileId][i] &= ~bit
+        }
+      }
+    }
+  } else if addr >= 0x9800 && addr <= 0x9FFF {
+    baseAddr := addr-0x8000
+
+    return |baseAddr| { // r
+      return gb.ppu.vram[baseAddr]
+    }, |baseAddr| { // w
+      gb.ppu.vram[baseAddr] = value
+    }
+  } else if addr >= 0xA000 && addr <= 0xDFFF {
+    baseAddr := addr-0xA000
+
+    return |baseAddr| { // r
+      return gb.ram[baseAddr]
+    }, |baseAddr| { // w
+      gb.ram[baseAddr] = value
+    }
+  } else if addr >= 0xE000 && addr <= 0xFDFF {
+    baseAddr := addr-0xE000+0x2000
+
+    return |baseAddr| { // r
+      return gb.ram[baseAddr]
+    }, |baseAddr| { // w
+      gb.ram[baseAddr] = value
+    }
+  } else if addr >= 0xFE00 && addr <= 0xFEFF { // NOTE: has invalid region too
+    baseAddr := addr-0xFE00
+
+    return |baseAddr| { // r
+      return gb.ppu.oam[baseAddr]
+    }, |baseAddr| { // w
+      gb.ppu.oam[baseAddr] = value;
+    }
+  } else { // io
+    if addr >= 0xFF80 && addr <= 0xFFFE { // hiram
+      baseAddr := addr-(0xFF80-0x4000)
+    
+      return |baseAddr| { // r
+        return gb.ram[baseAddr]
+      }, |baseAddr| { // w
+        gb.ram[baseAddr] = value
+      }
+    }
+
+    if addr >= 0xFF10 && addr <= 0xFF3F {
+      return {return 0}, {} // audio stubs @stub
+    }
+
+    switch addr&0xFF {
+    case 0x00: // joy
+      return { // r
+        btns := 0
+        switch (~(gb.io_joy>>4))&0x3 {
+        case JOYSELECT_ALLS, JOYSELECT_NONE:
+          btns = 0xF
+        case JOYSELECT_BTNS:
+          btns = (~gb.joyData)&0xF
+        case JOYSELECT_DPAD:
+          btns = (~(gb.joyData>>4))&0xF
+        }
+        return btns;
+      }, { // w
+        gb.io_joy = value&0x3F
+      }
+    case 0x01, 0x02: // @stub (serial comm)
+      return {return 0}, {}
+    case 0x04: // div
+      return {
+        return ((gb.cycles-gb.divCycles)/64)&0xFF
+      }, {
+        gb.divCycles = gb.cycles
+      }
+    case 0x05: // TIMA
+      return {
+        return gb.io_tima
+      }, {
+        gb.io_tima = value
+      }
+    case 0x06: // TMA
+      return {
+        return gb.io_tma
+      }, {
+        gb.io_tma = value
+      }
+    case 0x07: // TAC
+      return {
+        return gb.io_tac
+      }, {
+        gb.io_tac = value
+        gb.timerCycles = gb.cycles
+      }
+    case 0x0F: // IRQ
+      return {
+        return gb.io_irq
+      }, {
+        gb.io_irq = value&0x1F
+      }
+    case 0x40: // LCDC
+      return {
+        return gb.ppu.lcdc
+      }, {
+        gb.ppu.lcdc = value
+        gb.ppu.activeTileMapper = (value & LCDC_TILE_SEL)>0 ? &gb.ppu.tileMapperA : &gb.ppu.tileMapperB
+        gb.ppu.activeWindowAddr = (value & LCDC_WINDOW_SEL)>0 ? 0x1C00 : 0x1800;
+        gb.ppu.activeBgAddr     = (value & LCDC_BG_SEL)>0 ? 0x1C00 : 0x1800;
+      }
+    case 0x41: // LCD
+      return {
+        return gb.ppu.lcd
+      }, {
+        gb.ppu.lcd = value&0x78
+      }
+    case 0x42: // Scroll Y
+      return {
+        return gb.ppu.scy
+      }, {
+        gb.ppu.scy = value
+      }
+    case 0x43: // Scroll X
+      return {
+        return gb.ppu.scx
+      }, {
+        gb.ppu.scx = value
+      }
+    case 0x44: // PPU Y / LY
+      return { 
+        return gb.ppu.y
+      }, {
+        // cant
+      }
+    case 0x45: // LCD y compare
+      return {
+        return gb.ppu.lyc
+      }, {
+        gb.ppu.lyc = value
+      }
+    case 0x46:
+      return {
+        return gb.ppu.oamdma
+      }, {
+        gb.ppu.oamdma = value
+        gb.cycles += 160
+        for i:=0; i<0xA0; i++ {
+          gb.ppu.oam[i] = memMapR[uint16(value<<8)|i](gb)
+        }
+      }
+    case 0x47: // BG pallete
+      return {
+        return gb.ppu.bgp
+      }, {
+        gb.ppu.bgp = value
+        gb.ppu.bgp_p[0] = colors[(value   )&0x3]
+        gb.ppu.bgp_p[1] = colors[(value>>2)&0x3]
+        gb.ppu.bgp_p[2] = colors[(value>>4)&0x3]
+        gb.ppu.bgp_p[3] = colors[(value>>6)&0x3]
+      }
+    case 0x48:  
+      return {
+        return gb.ppu.o0p
+      }, {
+        gb.ppu.o0p = value
+        gb.ppu.o0p_p[0] = colors[(value   )&0x3]
+        gb.ppu.o0p_p[1] = colors[(value>>2)&0x3]
+        gb.ppu.o0p_p[2] = colors[(value>>4)&0x3]
+        gb.ppu.o0p_p[3] = colors[(value>>6)&0x3]
+      }
+    case 0x49: 
+      return {
+        return gb.ppu.o1p
+      }, {
+        gb.ppu.o1p = value
+        gb.ppu.o1p_p[0] = colors[(value   )&0x3]
+        gb.ppu.o1p_p[1] = colors[(value>>2)&0x3]
+        gb.ppu.o1p_p[2] = colors[(value>>4)&0x3]
+        gb.ppu.o1p_p[3] = colors[(value>>6)&0x3]
+      }
+    case 0xFF: // IE - interrupt enable
+      return {
+        return gb.io_ie
+      }, {
+        gb.io_ie = value & 0x1F
+      }
+    case 0x7F, 0x4A, 0x4B: // @stub some stubs
+      return {
+        return 0
+      }, {
+        //...
+      }
+    default:
+      baseAddr := addr&0xFF
+      return |baseAddr| {
+        exit(1, sprintf("Bad IO register read... %02X", baseAddr))
+        return 0
+      }, |baseAddr| {
+        exit(1, sprintf("Bad IO register write... %02X", baseAddr))
+      }
+    }
+  }
+
+  return {exit(1, "D:"); return 0}, {exit(1, "D:")}
+}
+
+fn (gb: ^Gameboy) push16(value: uint16) {
+  s := gb.cpu.regs[REG_SP]
+  memMapW[s](gb, value>>8)
+  memMapW[s-1](gb, value&0xFF)
+  gb.cpu.regs[REG_SP]-=2
+}
+
+fn (gb: ^Gameboy) pop16(): uint16 {
+  s := gb.cpu.regs[REG_SP]
+  a := memMapR[s+1](gb)
+  b := uint(memMapR[s+2](gb))
+  gb.cpu.regs[REG_SP]+=2
+  return a | (b << 8)
+}
+
+fn (gb: ^Gameboy) call(handler: uint16) {
+  // if debug {
+  //   printf("CALLING %04X\n", handler)
+  // }
+  gb.push16(pcReg^)
+  pcReg^ = handler
+}
+
+fn (gb: ^Gameboy) irq(handler: uint16, irq: uint8) {
+  // if debug {
+  //   printf("IRQ: %x %x %4X\n", gb.io_ie, gb.io_irq, handler)
+  // }
+  gb.cpu.ime = false
+  gb.io_irq &= ~irq
+  gb.call(handler)
+}
+
+fn drawScanline*(ppu: weak ^PPU, gb: weak ^Gameboy) {
+  if (ppu.lcdc & LCDC_WINDOW_ENABLE)>0 {
+    begin := ppu.y/8*32+ppu.activeWindowAddr
+    ty := ppu.y%8*8
+    yy := ppu.y*160
+    bgp, scr := ppu.bgp_p, &ppu.screen
+
+    for i:=0; i<20; i++ {
+      t := ppu.tileCache[ppu.activeTileMapper[ppu.vram[begin+i]]]
+      scr[yy  ] = bgp[t[ty  ]]
+      scr[yy+1] = bgp[t[ty+1]]
+      scr[yy+2] = bgp[t[ty+2]]
+      scr[yy+3] = bgp[t[ty+3]]
+      scr[yy+4] = bgp[t[ty+4]]
+      scr[yy+5] = bgp[t[ty+5]]
+      scr[yy+6] = bgp[t[ty+6]]
+      scr[yy+7] = bgp[t[ty+7]]
+      yy+=8
+    }
+  } else if (ppu.lcdc & LCDC_BG_ENABLE)>0 {
+    begin := ppu.y/8*32+ppu.activeBgAddr
+    ty := ppu.y%8*8
+    yy := ppu.y*160
+    bgp, scr := ppu.bgp_p, &ppu.screen
+
+    for i:=0; i<20; i++ {
+      t := ppu.tileCache[ppu.activeTileMapper[ppu.vram[begin+i]]]
+      scr[yy  ] = bgp[t[ty  ]]
+      scr[yy+1] = bgp[t[ty+1]]
+      scr[yy+2] = bgp[t[ty+2]]
+      scr[yy+3] = bgp[t[ty+3]]
+      scr[yy+4] = bgp[t[ty+4]]
+      scr[yy+5] = bgp[t[ty+5]]
+      scr[yy+6] = bgp[t[ty+6]]
+      scr[yy+7] = bgp[t[ty+7]]
+      yy+=8
+    }
+  }
+}
+
+fn cyclePPU*(ppu: weak ^PPU, gb: weak ^Gameboy, cyc: uint) {
+  if (ppu.lcdc & LCDC_PPU_ENABLE)==0 {
+    return
+  }
+
+  ppu.x += cyc*4
+  if ppu.x >= 456 {
+    if ppu.y < 144 {
+      drawScanline(ppu, gb)
+    }
+    ppu.x %= 456
+    ppu.y += 1
+    if ppu.y == 144 { // VBLANK
+      gb.io_irq |= IF_VBLANK
+      for i:=0; i<0xA0; i+=4 {
+        oy, ox, tile, attr := int(ppu.oam[i])-16, int(ppu.oam[i+1])-8, ppu.oam[i+2], ppu.oam[i+3]
+        flipX := (attr&(1<<5))>0
+        flipY := (attr&(1<<6))>0
+        pal := (attr&(1<<4))>0 ? ppu.o1p : ppu.o0p
+        pal_p := (attr&(1<<4))>0 ? ppu.o1p_p : ppu.o0p_p
+
+        for x:=0; x<8; x++ {
+          for y:=0; y<8; y++ {
+            px := x+ox
+            py := y+oy
+            if px<0 || py<0 || py>=144 || px>=160 {
+              continue
+            }
+
+            if flipX { x = 7-x }
+            if flipY { y = 7-y }
+
+            c := ppu.tileCache[tile][x+y*8]
+            if (pal>>(c*2))&3 == 0 {
+              continue
+            }
+
+            ppu.screen[px+py*160] = pal_p[c]
+          }
+        }
+      }
+      resume()
+    } else if ppu.y == 154 {
+      ppu.y = 0
+    }
+  }
+}
+
+fn run*(gb: weak ^Gameboy) {
+  start = std::clock()
+
+  ppu := weak ^PPU(&gb.ppu)
+
+  for gb.running {
+    // if pcReg^ == 0 {
+    //   exit(1, "Something bad happened")
+    // }
+
+    // handle IRQ's
+    if gb.io_irq>0 && gb.cpu.ime {
+      if (gb.io_irq & gb.io_ie & IF_VBLANK) > 0 { gb.irq(0x40, IF_VBLANK); continue }
+      if (gb.io_irq & gb.io_ie & IF_LCD) > 0    { gb.irq(0x48, IF_LCD); continue }
+      if (gb.io_irq & gb.io_ie & IF_TIMER) > 0  { gb.irq(0x50, IF_TIMER); continue }
+      if (gb.io_irq & gb.io_ie & IF_SERIAL) > 0 { gb.irq(0x58, IF_SERIAL); continue }
+      if (gb.io_irq & gb.io_ie & IF_JOY) > 0    { gb.irq(0x60, IF_JOY); continue }
+    }
+
+    start := pcReg^
+    opcode := memMapR[start](gb)
+    // countId := uint(opcode)
+    var info: weak^ OpcodeInfo
+    if opcode == 0xCB {
+      opcode = memMapR[start+1](gb)
+      pcReg^+=2
+      info = &gb.jmpTable2[opcode]
+      // countId += 0x100
+    } else {
+      info = &gb.jmpTable[opcode]
+      pcReg^++
+    }
+    // if !valid(info.handler) {
+    //   exit(1, sprintf("Invalid opcode: %02X", opcode))
+    // }
+    startCyc := gb.cycles
+    info.a.decode(gb)
+    info.b.decode(gb)
+
+    // if debug {
+    //   flags := ""
+    //   if afReg^&FLAG_Z != 0 { flags += "Z" } else { flags += "z" }
+    //   if afReg^&FLAG_N != 0 { flags += "N" } else { flags += "n" }
+    //   if afReg^&FLAG_H != 0 { flags += "H" } else { flags += "h" }
+    //   if afReg^&FLAG_C != 0 { flags += "C" } else { flags += "c" }
+    //   printf("%02X %s %04X:%04X %-6s %-10s %s\n",
+    //     opcode,
+    //     flags,
+    //     start,
+    //     pcReg^,
+    //     info.name,
+    //     info.a.fmt(gb),
+    //     info.b.fmt(gb)
+    //   )
+    // }
+     
+    // t_start := std::clock() 
+    info.handler(gb, info.a, info.b)
+    gb.cycles += info.cycles
+    // gb.counts[countId].cnt++
+    // gb.counts[countId].time += std::clock()-t_start
+
+    if (gb.io_tac & 0x4) > 0 {
+      freq := ctlClocks[gb.io_tac&0x3]
+
+      if (gb.cycles-gb.timerCycles) >= freq {
+        gb.timerCycles -= freq
+        if gb.io_tima == 0xFF {
+          gb.io_tima = gb.io_tma
+          gb.io_irq |= IF_TIMER
+        } else {
+          gb.io_tima++
+        }
+      }
+    }
+
+    cyclePPU(ppu, gb, gb.cycles-startCyc)
+  }
+}
+
+//----------------------------------------------------------------------------//
+
+fn (this: ^None) decode(gb: weak ^Gameboy) {
+}
+
+fn (this: ^None) fmt(gb: weak ^Gameboy): str {
+  return ""
+}
+
+fn (this: ^None) read(gb: weak ^Gameboy): uint {
+  exit(1, "Read on none receiver")
+  return 0
+}
+
+fn (this: ^None) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on none receiver")
+}
+
+
+fn (this: ^Const) decode(gb: weak ^Gameboy) {
+}
+
+fn (this: ^Const) fmt(gb: weak ^Gameboy): str {
+  return sprintf("$%04X", this.ctx)
+}
+
+fn (this: ^Const) read(gb: weak ^Gameboy): uint {
+  return this.ctx
+}
+
+fn (this: ^Const) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on const receiver")
+}
+
+
+fn (this: ^Imm8) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb)
+  pcReg^++
+}
+
+fn (this: ^Imm8) fmt(gb: weak ^Gameboy): str {
+  return sprintf("$%02X", this.ctx)
+}
+
+fn (this: ^Imm8) read(gb: weak ^Gameboy): uint {
+  return this.ctx
+}
+
+fn (this: ^Imm8) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on imm receiver")
+}
+
+
+fn (this: ^Rel8SP) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb)
+  pcReg^++
+}
+
+fn (this: ^Rel8SP) fmt(gb: weak ^Gameboy): str {
+  return sprintf("%d + [SP:%04X]", etc::u8toi8(this.ctx), gb.cpu.regs[REG_SP])
+}
+
+fn (this: ^Rel8SP) read(gb: weak ^Gameboy): uint {
+  return etc::u8toi8(this.ctx) + int(gb.cpu.regs[REG_SP])
+}
+
+fn (this: ^Rel8SP) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on imm receiver")
+}
+
+
+fn (this: ^Rel8) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb)
+  pcReg^++
+}
+
+fn (this: ^Rel8) fmt(gb: weak ^Gameboy): str {
+  return sprintf("%d", etc::u8toi8(this.ctx))
+}
+
+fn (this: ^Rel8) read(gb: weak ^Gameboy): uint {
+  return this.ctx
+}
+
+fn (this: ^Rel8) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on imm receiver")
+}
+
+
+fn (this: ^Imm16) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb) | (memMapR[pcReg^+1](gb)<<8)
+  pcReg^+=2
+}
+
+fn (this: ^Imm16) fmt(gb: weak ^Gameboy): str {
+  return sprintf("$%04X", this.ctx)
+}
+
+fn (this: ^Imm16) read(gb: weak ^Gameboy): uint {
+  return this.ctx
+}
+
+fn (this: ^Imm16) write(gb: weak ^Gameboy, value: uint) {
+  exit(1, "Write on imm receiver")
+}
+
+
+fn (this: ^Reg16) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^Reg16) fmt(gb: weak ^Gameboy): str {
+  return sprintf("%s=%04X", regNames[int(this.reg)], gb.cpu.regs[int(this.reg)])
+}
+
+fn (this: ^Reg16) read(gb: weak ^Gameboy): uint {
+  return gb.cpu.regs[int(this.reg)]
+}
+
+fn (this: ^Reg16) write(gb: weak ^Gameboy, value: uint) {
+  gb.cpu.regs[int(this.reg)] = value
+}
+
+
+fn (this: ^RegHi) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^RegHi) fmt(gb: weak ^Gameboy): str {
+  return sprintf("%s=%02X", regNamesHi[int(this.reg)], gb.cpu.regs[int(this.reg)]>>8)
+}
+
+fn (this: ^RegHi) read(gb: weak ^Gameboy): uint {
+  return gb.cpu.regs[int(this.reg)]>>8
+}
+
+fn (this: ^RegHi) write(gb: weak ^Gameboy, value: uint) {
+  gb.cpu.regs[int(this.reg)] = (gb.cpu.regs[int(this.reg)]&0x00FF)|(value<<8)
+}
+
+
+fn (this: ^RegLo) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^RegLo) fmt(gb: weak ^Gameboy): str {
+  return sprintf("%s=%02X", regNamesLo[int(this.reg)], gb.cpu.regs[int(this.reg)]&0xFF)
+}
+
+fn (this: ^RegLo) read(gb: weak ^Gameboy): uint {
+  return gb.cpu.regs[int(this.reg)]&0xFF
+}
+
+fn (this: ^RegLo) write(gb: weak ^Gameboy, value: uint) {
+  gb.cpu.regs[int(this.reg)] = (gb.cpu.regs[int(this.reg)]&0xFF00)|(value&0xFF)
+}
+
+
+fn (this: ^DerefReg) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^DerefReg) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[%s|%04X]", regNames[int(this.reg)], gb.cpu.regs[int(this.reg)])
+}
+
+fn (this: ^DerefReg) read(gb: weak ^Gameboy): uint {
+  return memMapR[gb.cpu.regs[int(this.reg)]](gb)
+}
+
+fn (this: ^DerefReg) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[gb.cpu.regs[int(this.reg)]](gb, value&0xFF)
+}
+
+
+fn (this: ^DerefRegLoH) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^DerefRegLoH) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[%s|%04X]", regNamesLo[int(this.reg)], gb.cpu.regs[int(this.reg)]|0xFF00)
+}
+
+fn (this: ^DerefRegLoH) read(gb: weak ^Gameboy): uint {
+  return memMapR[gb.cpu.regs[int(this.reg)]|0xFF00](gb)
+}
+
+fn (this: ^DerefRegLoH) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[gb.cpu.regs[int(this.reg)]|0xFF00](gb, value&0xFF)
+}
+
+
+fn (this: ^DerefRegInc) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^DerefRegInc) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[%s+|%04X]", regNames[int(this.reg)], gb.cpu.regs[int(this.reg)])
+}
+
+fn (this: ^DerefRegInc) read(gb: weak ^Gameboy): uint {
+  v := memMapR[gb.cpu.regs[int(this.reg)]](gb)
+  gb.cpu.regs[int(this.reg)]++
+  return v
+}
+
+fn (this: ^DerefRegInc) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[gb.cpu.regs[int(this.reg)]](gb, value&0xFF)
+  gb.cpu.regs[int(this.reg)]++
+}
+
+
+fn (this: ^DerefRegDec) decode(gb: weak ^Gameboy) {}
+
+fn (this: ^DerefRegDec) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[%s-|%04X]", regNames[int(this.reg)], gb.cpu.regs[int(this.reg)])
+}
+
+fn (this: ^DerefRegDec) read(gb: weak ^Gameboy): uint {
+  v := memMapR[gb.cpu.regs[int(this.reg)]](gb)
+  gb.cpu.regs[int(this.reg)]--
+  return v
+}
+
+fn (this: ^DerefRegDec) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[gb.cpu.regs[int(this.reg)]](gb, value&0xFF)
+  gb.cpu.regs[int(this.reg)]--
+}
+
+
+fn (this: ^Adr8H) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb)
+  pcReg^++
+}
+
+fn (this: ^Adr8H) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[FF%02X]", this.ctx)
+}
+
+fn (this: ^Adr8H) read(gb: weak ^Gameboy): uint {
+    return memMapR[this.ctx|0xFF00](gb)
+}
+
+fn (this: ^Adr8H) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[this.ctx|0xFF00](gb, value&0xFF)
+}
+
+
+fn (this: ^Adr16) decode(gb: weak ^Gameboy) {
+  this.ctx = memMapR[pcReg^](gb) | (memMapR[pcReg^+1](gb)<<8)
+  pcReg^+=2
+}
+
+fn (this: ^Adr16) fmt(gb: weak ^Gameboy): str {
+  return sprintf("[%04X]", this.ctx)
+}
+
+fn (this: ^Adr16) read(gb: weak ^Gameboy): uint {
+  return memMapR[this.ctx](gb)
+}
+
+fn (this: ^Adr16) write(gb: weak ^Gameboy, value: uint) {
+  memMapW[this.ctx](gb, value&0xFF)
+}
+
+
+//----------------------------------------------------------------------------//
+
+
+fn doNop(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+
+}
+
+fn doJp(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  pcReg^ = rxa.read(gb)
+}
+
+fn doJpnz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_Z)>0) {
+    pcReg^ = rxa.read(gb)
+    gb.cycles++
+  }
+}
+
+fn doJpz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_Z)>0) {
+    pcReg^ = rxa.read(gb)
+    gb.cycles++
+  }
+}
+
+fn doJpnc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_C)>0) {
+    pcReg^ = rxa.read(gb)
+    gb.cycles++
+  }
+}
+
+fn doJpc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_C)>0) {
+    pcReg^ = rxa.read(gb)
+    gb.cycles++
+  }
+}
+
+fn doAnd(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  r := rxa.read(gb) & rxb.read(gb)
+
+  afReg^ &= 0xFF00
+  afReg^ |= FLAG_H|(uint(r == 0)*FLAG_Z)
+
+  rxa.write(gb, r)
+}
+
+fn doXor(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  r := rxa.read(gb) ~ rxb.read(gb)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)
+
+  rxa.write(gb, r)
+}
+
+fn doOr(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  r := rxa.read(gb) | rxb.read(gb)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)
+
+  rxa.write(gb, r)
+}
+
+fn doLd(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  rxa.write(gb, rxb.read(gb))
+}
+
+// @SpecialCase performance
+fn doLddHlA(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  memMapW[gb.cpu.regs[REG_HL]](gb, afReg^>>8)
+  gb.cpu.regs[REG_HL]--
+}
+
+// @SpecialCase performance
+fn doLdham8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  af := afReg^
+  afReg^ &= 0xFF
+  afReg^ |= uint( memMapR[0xFF00|uint(memMapR[pcReg^](gb)) ](gb) )<<8
+  pcReg^++
+}
+
+fn doDec8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  r := (v-1)&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00|FLAG_C
+  afReg^ |= FLAG_N|(uint(r==0)*FLAG_Z)|(uint((((v&0xF)-1) & 0x10) > 0)*FLAG_H)
+}
+
+fn doInc8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  r := (v+1)&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00|FLAG_C
+  afReg^ |= (uint(r==0)*FLAG_Z)|(uint((((v&0xF)+1) & 0x10) > 0)*FLAG_H)
+}
+
+fn doDec16(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  rxa.write(gb, (uint(rxa.read(gb))-1)&0xFFFF)
+}
+
+fn doInc16(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  rxa.write(gb, (uint(rxa.read(gb))+1)&0xFFFF)
+}
+
+fn doJr(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  pcReg^ += etc::u8toi8(rxa.read(gb))
+}
+
+fn doJrnz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_Z)>0) {
+    pcReg^ += etc::u8toi8(rxa.read(gb))
+    gb.cycles++
+  }
+}
+
+fn doJrz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_Z)>0) {
+    pcReg^ += etc::u8toi8(rxa.read(gb))
+    gb.cycles++
+  }
+}
+
+fn doJrnc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_C)>0) {
+    pcReg^ += etc::u8toi8(rxa.read(gb))
+    gb.cycles++
+  }
+}
+
+fn doJrc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_C)>0) {
+    pcReg^ += etc::u8toi8(rxa.read(gb))
+    gb.cycles++
+  }
+}
+
+fn doDi(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  gb.cpu.ime = false
+}
+
+fn doEi(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  gb.cpu.ime = true
+}
+
+fn doHalt(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  exit(1, "Halted")
+}
+
+fn doStop(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  exit(1, "Stopped")
+}
+
+fn doCp(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  r := a-b
+  h := (((a&0xF)-(b&0xF)) & 0x10)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r==0)*FLAG_Z)|FLAG_N|(uint(h>0)*FLAG_H)|(uint((r&0x100)>0)*FLAG_C)
+}
+
+fn doCall(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  gb.call(rxa.read(gb))
+}
+
+fn doCallnz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_Z)>0) {
+    gb.call(rxa.read(gb))
+    gb.cycles += 3
+  }
+}
+
+fn doCallz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_Z)>0) {
+    gb.call(rxa.read(gb))
+    gb.cycles += 3
+  }
+}
+
+fn doCallnc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_C)>0) {
+    gb.call(rxa.read(gb))
+    gb.cycles += 3
+  }
+}
+
+fn doCallc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_C)>0) {
+    gb.call(rxa.read(gb))
+    gb.cycles += 3
+  }
+}
+
+fn doRet(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  pcReg^ = gb.pop16()
+}
+
+fn doRetnz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_Z)>0) {
+    pcReg^ = gb.pop16()
+    gb.cycles += 3
+  }
+}
+
+fn doRetz(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_Z)>0) {
+    pcReg^ = gb.pop16()
+    gb.cycles += 3
+  }
+}
+
+fn doRetnc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if !((afReg^&FLAG_C)>0) {
+    pcReg^ = gb.pop16()
+    gb.cycles += 3
+  }
+}
+
+fn doRetc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  if ((afReg^&FLAG_C)>0) {
+    pcReg^ = gb.pop16()
+    gb.cycles += 3
+  }
+}
+
+fn doReti(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  pcReg^ = gb.pop16()
+  gb.cpu.ime = true
+}
+
+fn doPush16(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  gb.push16(rxa.read(gb))
+}
+
+fn doPop16(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  rxa.write(gb, gb.pop16())
+}
+
+fn doRl(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x80
+  r := ((v<<1)| uint((afReg^&FLAG_C)>0) )&0xFF
+  rxa.write(gb, r)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(uint(carry > 0)*FLAG_C)
+}
+
+fn doRla(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x80
+  r := ((v<<1)| uint((afReg^&FLAG_C)>0) )&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= uint(carry>0)*FLAG_C
+}
+
+fn doRr(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := ((v>>1)|(uint((afReg^&FLAG_C)>0)<<7))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= carry*FLAG_C|(uint(r==0)*FLAG_Z)
+}
+
+fn doRra(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := ((v>>1)|(uint((afReg^&FLAG_C)>0)<<7))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= carry*FLAG_C
+}
+
+fn doRlc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := (v&0x80)>0
+  r := ((v<<1)|uint(carry))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(uint(carry)*FLAG_C)
+}
+
+fn doRlca(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := (v&0x80)>0
+  r := ((v<<1)|uint(carry))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= uint(carry)*FLAG_C
+}
+
+fn doRrc(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := ((v>>1)|(carry<<7))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(carry*FLAG_C)
+}
+
+fn doRrca(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := ((v>>1)|(carry<<7))&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (carry*FLAG_C)
+}
+
+fn doSla(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := (v&0x80)>0
+  r := (v<<1)&0xFF
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(uint(carry)*FLAG_C)
+}
+
+fn doSra(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := (v>>1)|(v&0x80)
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(carry*FLAG_C)
+}
+
+fn doSrl(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  carry := v&0x1
+  r := (v>>1)
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)|(carry*FLAG_C)
+}
+
+fn doSwap(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  v := rxa.read(gb)
+  r := ((v&0xF)<<4)|(v>>4)
+  rxa.write(gb, r)
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(r == 0)*FLAG_Z)
+}
+
+fn doAdd16(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  r := a+b
+  h := (((a&0xFFF)+(b&0xFFF)) & 0x1000)
+  rxa.write(gb, r&0xFFFF)
+  
+  afReg^ &= 0xFF00|FLAG_Z
+  afReg^ |= (uint(h>0)*FLAG_H)|(uint((r&0x10000)>0)*FLAG_C)
+}
+
+fn doMkBit(which: uint8): fn (gb: weak ^Gameboy, rxa, rxb: Receiver) {
+  return |which| {
+    a := rxa.read(gb)&(1<<which)
+    afReg^ &= 0xFF00|FLAG_C
+    afReg^ |= (uint(a==0)*FLAG_Z)|FLAG_H
+  }
+}
+
+fn doMkRes(which: uint8): fn (gb: weak ^Gameboy, rxa, rxb: Receiver) {
+  return |which| {
+    rxa.write(gb, rxa.read(gb)&((~(1<<which))&0xFF))
+  }
+}
+
+fn doMkSet(which: uint8): fn (gb: weak ^Gameboy, rxa, rxb: Receiver) {
+  return |which| {
+    rxa.write(gb, rxa.read(gb)|(1<<which))
+  }
+}
+
+fn doAdd8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  r := a+b
+  h := (((a&0xF)+(b&0xF)) & 0x10)
+  rxa.write(gb, r&0xFF)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint((r&0x100)>0)*FLAG_C)|(uint(h>0)*FLAG_H)|(uint(r==0)*FLAG_Z)
+}
+
+fn doAdc8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  c := uint((afReg^&FLAG_C)>0)
+  r := a+b+c
+  h := (((a&0xF)+(b&0xF)+c) & 0x10)
+  rxa.write(gb, r&0xFF)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint((r&0x100)>0)*FLAG_C)|(uint(h>0)*FLAG_H)|(uint(r==0)*FLAG_Z)
+}
+
+fn doSub8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  r := a-b
+  h := (((a&0xF)-(b&0xF)) & 0x10) // TODO: probably wrong  
+  rxa.write(gb, r&0xFF)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(b>a)*FLAG_C)|(uint(h>0)*FLAG_H)|(uint(r==0)*FLAG_Z)|FLAG_N
+}
+
+fn doSbc8(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := rxa.read(gb)
+  b := rxb.read(gb)
+  c := uint((afReg^&FLAG_C)>0)
+  r := a-b-c
+  h := (((a&0xF)-(b&0xF)-c) & 0x10) // TODO: probably wrong
+  rxa.write(gb, r&0xFF)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint((b+c)>a)*FLAG_C)|(uint(h>0)*FLAG_H)|(uint(r==0)*FLAG_Z)|FLAG_N
+}
+
+fn doCpl(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  rxa.write(gb, (rxa.read(gb) ~ 0xFF) & 0xFF)
+  afReg^ |= FLAG_N|FLAG_H
+}
+
+// maybe this doesn't work
+fn doDaa(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  adjust := uint(0)
+  result := rxa.read(gb)
+  afReg^ &= 0xFF00|FLAG_N
+
+  if (afReg^&FLAG_N)>0 {
+    if (afReg^&FLAG_H)>0 {
+      adjust += 0x06
+    }
+    if (afReg^&FLAG_C)>0 {
+      adjust += 0x60
+    }
+    result -= adjust
+  } else {
+    if (result & 0xF) > 0x9 || (afReg^&FLAG_H) > 0 {
+      adjust += 0x06
+    }
+    if result > 0x99 || (afReg^&FLAG_C)>0 {
+      adjust += 0x60
+      afReg^ |= FLAG_C
+    }
+    result += adjust
+  }
+
+  a := result&0xFF
+  afReg^ |= (uint(a==0)*FLAG_Z)
+
+  rxa.write(gb, a)
+}
+
+fn doScf(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  afReg^ &= 0xFF00|FLAG_Z
+  afReg^ |= FLAG_C
+}
+
+fn doCcf(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  afReg^ &= 0xFF00|FLAG_Z|FLAG_C
+  afReg^ ~= FLAG_C
+}
+
+// @SpecialCase ADD SP, e8
+fn doAddr(gb: weak ^Gameboy, rxa, rxb: Receiver): void {
+  a := int(rxa.read(gb))
+  b := int(etc::u8toi8(rxb.read(gb)))
+  r := a+b
+  h := ( ((a&0xF)+(b&0xF)) & 0x10 )
+  rxa.write(gb, r)
+
+  afReg^ &= 0xFF00
+  afReg^ |= (uint(h>0)*FLAG_H)|(uint((r&0x100)>0)*FLAG_C)
+}
+
+//----------------------------------------------------------------------------//
+
+fn mkGameboy*(rom: []uint8): ^Gameboy {
+  var jmpTable: [0x100]OpcodeInfo
+  var jmpTable2: [0x100]OpcodeInfo
+  jmpTable[0x00] = {"NOP", doNop,   1, None{},           None{}           } // ok
+  jmpTable[0x01] = {"LD",  doLd,    3, Reg16{.bc},       Imm16{}          } // ok
+  jmpTable[0x02] = {"LD",  doLd,    2, DerefReg{.bc},    RegHi{.af}       } // ok
+  jmpTable[0x03] = {"INC", doInc16, 1, Reg16{.bc},       None{}           } // ok
+  jmpTable[0x04] = {"INC", doInc8,  1, RegHi{.bc},       None{}           } // ok
+  jmpTable[0x05] = {"DEC", doDec8,  1, RegHi{.bc},       None{}           } // ok
+  jmpTable[0x06] = {"LD",  doLd,    2, RegHi{.bc},       Imm8{}           } // ok
+  jmpTable[0x07] = {"RLCA",doRlca,  1, RegHi{.af},       None{}           } // ok
+  jmpTable[0x08] = {"LD",  doLd,    5, Adr16{},          Reg16{.sp}       } // ok
+  jmpTable[0x09] = {"ADD" ,doAdd16, 2, Reg16{.hl},       Reg16{.bc}       } // ok
+  jmpTable[0x0A] = {"LD",  doLd,    2, RegHi{.af},       DerefReg{.bc}    } // ok
+  jmpTable[0x0B] = {"DEC", doDec16, 2, Reg16{.bc},       None{}           } // ok
+  jmpTable[0x0C] = {"INC", doInc8,  1, RegLo{.bc},       None{}           } // ok
+  jmpTable[0x0D] = {"DEC", doDec8,  1, RegLo{.bc},       None{}           } // ok
+  jmpTable[0x0E] = {"LD",  doLd,    2, RegLo{.bc},       Imm8{}           } // ok
+  jmpTable[0x0F] = {"RRCA",doRrca,  1, RegHi{.af},       None{}           } // ok
+
+  jmpTable[0x10] = {"STOP",doStop,  1, None{},           None{}           } // ok
+  jmpTable[0x11] = {"LD",  doLd,    3, Reg16{.de},       Imm16{}          } // ok
+  jmpTable[0x12] = {"LD",  doLd,    2, DerefReg{.de},    RegHi{.af}       } // ok
+  jmpTable[0x13] = {"INC", doInc16, 1, Reg16{.de},       None{}           } // ok
+  jmpTable[0x14] = {"INC", doInc8,  1, RegHi{.de},       None{}           } // ok
+  jmpTable[0x15] = {"DEC", doDec8,  1, RegHi{.de},       None{}           } // ok
+  jmpTable[0x16] = {"LD",  doLd,    2, RegHi{.de},       Imm8{}           } // ok
+  jmpTable[0x17] = {"RLA", doRla,   1, RegHi{.af},       None{}           } // ok
+  jmpTable[0x18] = {"JR",  doJr,    3, Rel8{},           None{}           } // ok
+  jmpTable[0x19] = {"ADD" ,doAdd16, 2, Reg16{.hl},       Reg16{.de}       } // ok
+  jmpTable[0x1A] = {"LD",  doLd,    2, RegHi{.af},       DerefReg{.de}    } // ok
+  jmpTable[0x1B] = {"DEC", doDec16, 2, Reg16{.de},       None{}           } // ok
+  jmpTable[0x1C] = {"INC", doInc8,  1, RegLo{.de},       None{}           } // ok
+  jmpTable[0x1D] = {"DEC", doDec8,  1, RegLo{.de},       None{}           } // ok
+  jmpTable[0x1E] = {"LD",  doLd,    2, RegLo{.de},       Imm8{}           } // ok
+  jmpTable[0x1F] = {"RRA", doRra,   1, RegHi{.af},       None{}           } // ok
+  
+  jmpTable[0x20] = {"JRNZ",doJrnz,  2, Rel8{},           None{}           } // ok
+  jmpTable[0x21] = {"LD",  doLd,    3, Reg16{.hl},       Imm16{}          } // ok
+  jmpTable[0x22] = {"LD",  doLd,    2, DerefRegInc{.hl}, RegHi{.af}       } // ok
+  jmpTable[0x23] = {"INC", doInc16, 2, Reg16{.hl},       None{}           } // ok
+  jmpTable[0x24] = {"INC", doInc8,  1, RegHi{.hl},       None{}           } // ok
+  jmpTable[0x25] = {"DEC", doDec8,  1, RegHi{.hl},       None{}           } // ok
+  jmpTable[0x26] = {"LD",  doLd,    2, RegHi{.hl},       Imm8{}           } // ok
+  jmpTable[0x27] = {"DAA", doDaa,   1, RegHi{.af},       None{}           } // ok
+  jmpTable[0x28] = {"JRZ", doJrz,   2, Rel8{},           None{}           } // ok
+  jmpTable[0x29] = {"ADD" ,doAdd16, 2, Reg16{.hl},       Reg16{.hl}       } // ok
+  jmpTable[0x2A] = {"LD",  doLd,    2, RegHi{.af},       DerefRegInc{.hl} } // ok
+  jmpTable[0x2B] = {"DEC", doDec16, 2, Reg16{.hl},       None{}           } // ok
+  jmpTable[0x2C] = {"INC", doInc8,  1, RegLo{.hl},       None{}           } // ok
+  jmpTable[0x2D] = {"DEC", doDec8,  1, RegLo{.hl},       None{}           } // ok
+  jmpTable[0x2E] = {"LD",  doLd,    2, RegLo{.hl},       Imm8{}           } // ok
+  jmpTable[0x2F] = {"CPL", doCpl ,  1, RegHi{.af},       None{}           } // ok
+
+  jmpTable[0x30] = {"JRNC",doJrnc,  2, Rel8{},           None{}           } // ok
+  jmpTable[0x31] = {"LD",  doLd,    3, Reg16{.sp},       Imm16{}          } // ok
+  jmpTable[0x32] = {"LD",  doLddHlA,2, DerefRegDec{.hl}, RegHi{.af}       } // ok
+  jmpTable[0x33] = {"INC", doInc16, 2, Reg16{.sp},       None{}           } // ok
+  jmpTable[0x34] = {"INC", doInc8,  3, DerefReg{.hl},    None{}           } // ok
+  jmpTable[0x35] = {"DEC", doDec8,  3, DerefReg{.hl},    None{}           } // ok
+  jmpTable[0x36] = {"LD",  doLd,    3, DerefReg{.hl},    Imm8{}           } // ok
+  jmpTable[0x37] = {"SCF", doScf,   1, None{},           None{}           } // ok
+  jmpTable[0x38] = {"JRC", doJrc,   2, Rel8{},           None{}           } // ok
+  jmpTable[0x39] = {"ADD" ,doAdd16, 2, Reg16{.hl},       Reg16{.sp}       } // ok
+  jmpTable[0x3A] = {"LD",  doLd,    2, RegHi{.af},       DerefRegDec{.hl} } // ok
+  jmpTable[0x3B] = {"DEC", doDec16, 2, Reg16{.sp},       None{}           } // ok
+  jmpTable[0x3C] = {"INC", doInc8,  1, RegHi{.af},       None{}           } // ok
+  jmpTable[0x3D] = {"DEC", doDec8,  1, RegHi{.af},       None{}           } // ok
+  jmpTable[0x3E] = {"LD",  doLd,    2, RegHi{.af},       Imm8{}           } // ok
+  jmpTable[0x3F] = {"CCF", doCcf,   1, None{},           None{}           } // ok
+
+  order := []Receiver{RegHi{.bc}, RegLo{.bc}, RegHi{.de}, RegLo{.de}, RegHi{.hl}, RegLo{.hl}, DerefReg{.hl}, RegHi{.af}}
+  for i:=0x40; i<=0x7F; i++ {
+    if i==0x76 {
+      jmpTable[i] = {"HALT", doHalt, 1, None{}, None{}}
+    }
+    a, b := i%8, ((i-0x40)/8)%8
+
+    cyc := 1
+    if a == 6 || b == 6 { // HL deref
+      cyc++
+    }
+
+    jmpTable[i] = {"LD", doLd, cyc, order[b], order[a]}
+  }
+
+  instrs := []struct{name: str; handler: Handler}{
+    {"ADD", doAdd8}, {"ADC", doAdc8}, {"SUB", doSub8}, {"SBC", doSbc8},
+    {"AND", doAnd}, {"XOR", doXor}, {"OR", doOr}, {"CP", doCp}
+  }
+  for i, instr in instrs {
+    for j, rec in order {
+      cyc := 1
+      if j == 6 {
+        cyc++
+      }
+      jmpTable[0x80+i*8+j] = {instr.name, instr.handler, cyc, RegHi{.af}, rec}
+    }
+  }
+
+  jmpTable[0xC0] = {"RETNZ", doRetnz, 2, None{},                    None{}          } // ok
+  jmpTable[0xC1] = {"POP",   doPop16, 3, Reg16{.bc},                None{}          } // ok
+  jmpTable[0xC2] = {"JPNZ",  doJpnz,  3, Imm16{},                   None{}          } // ok
+  jmpTable[0xC3] = {"JP",    doJp,    4, Imm16{},                   None{}          } // ok
+  jmpTable[0xC4] = {"CALLNZ",doCallnz,3, Imm16{},                   None{}          } // ok
+  jmpTable[0xC5] = {"PUSH",  doPush16,4, Reg16{.bc},                None{}          } // ok
+  jmpTable[0xC6] = {"ADD",   doAdd8,  2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xC7] = {"RST00", doCall,  4, Const{0x00},               None{}          } // ok
+  jmpTable[0xC8] = {"RETZ",  doRetz,  2, None{},                    None{}          } // ok
+  jmpTable[0xC9] = {"RET",   doRet,   4, None{},                    None{}          } // ok
+  jmpTable[0xCA] = {"JPZ",   doJpz,   3, Imm16{},                   None{}          } // ok
+  jmpTable[0xCC] = {"CALLZ", doCallz, 3, Imm16{},                   None{}          } // ok
+  jmpTable[0xCD] = {"CALL",  doCall,  6, Imm16{},                   None{}          } // ok
+  jmpTable[0xCE] = {"ADC",   doAdc8,  2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xCF] = {"RST08", doCall,  4, Const{0x08},               None{}          } // ok
+  
+  jmpTable[0xD0] = {"RETNC", doRetnc, 2, None{},                    None{}          } // ok
+  jmpTable[0xD1] = {"POP",   doPop16, 3, Reg16{.de},                None{}          } // ok
+  jmpTable[0xD2] = {"JPNC",  doJpnc,  3, Imm16{},                   None{}          } // ok
+  jmpTable[0xD4] = {"CALLNC",doCallnc,3, Imm16{},                   None{}          } // ok
+  jmpTable[0xD5] = {"PUSH",  doPush16,4, Reg16{.de},                None{}          } // ok
+  jmpTable[0xD6] = {"SUB",   doSub8,  2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xD7] = {"RST10", doCall,  4, Const{0x10},               None{}          } // ok
+  jmpTable[0xD8] = {"RETC",  doRetc,  2, None{},                    None{}          } // ok
+  jmpTable[0xD9] = {"RETI",  doReti,  4, None{},                    None{}          } // ok
+  jmpTable[0xDA] = {"JPC",   doJpc,   3, Imm16{},                   None{}          } // ok
+  jmpTable[0xDC] = {"CALLC", doCallc, 3, Imm16{},                   None{}          } // ok
+  jmpTable[0xDE] = {"SBC",   doSbc8,  2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xDF] = {"RST18", doCall,  4, Const{0x18},               None{}          } // ok
+
+  jmpTable[0xE0] = {"LDH",   doLd,    3, Adr8H{},                   RegHi{.af}      } // ok
+  jmpTable[0xE1] = {"POP",   doPop16, 3, Reg16{.hl},                None{}          } // ok
+  jmpTable[0xE2] = {"LDH",   doLd,    2, DerefRegLoH{.bc},          RegHi{.af}      } // ok
+  jmpTable[0xE5] = {"PUSH",  doPush16,4, Reg16{.hl},                None{}          } // ok
+  jmpTable[0xE6] = {"AND",   doAnd,   2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xE7] = {"RST20", doCall,  4, Const{0x20},               None{}          } // ok
+  jmpTable[0xE8] = {"ADD",   doAddr,  4, Reg16{.sp},                Rel8{}          } // ok
+  jmpTable[0xE9] = {"JP",    doJp,    1, Reg16{.hl},                None{}          } // ok
+  jmpTable[0xEA] = {"LD",    doLd,    4, Adr16{},                   RegHi{.af}      } // ok
+  jmpTable[0xEE] = {"XOR",   doXor,   2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xEF] = {"RST28", doCall,  4, Const{0x28},               None{}          } // ok
+
+  jmpTable[0xF0] = {"LDH A, [a8]", doLdham8, 3, None{},                    None{}          } // ok
+  jmpTable[0xF1] = {"POP",   doPop16, 3, Reg16{.af},                None{}          } // ok
+  jmpTable[0xF2] = {"LDH",   doLd,    2, RegHi{.af},                DerefRegLoH{.bc}} // ok
+  jmpTable[0xF3] = {"DI",    doDi,    1, None{},                    None{}          } // ok
+  jmpTable[0xF5] = {"PUSH",  doPush16,4, Reg16{.af},                None{}          } // ok
+  jmpTable[0xF6] = {"OR",    doOr,    2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xF7] = {"RST30", doCall,  4, Const{0x30},               None{}          } // ok
+  jmpTable[0xF8] = {"LD",    doLd,    3, Reg16{.hl},                Rel8SP{}        } // ok
+  jmpTable[0xF9] = {"LD",    doLd,    2, Reg16{.sp},                Reg16{.hl}      } // ok
+  jmpTable[0xFA] = {"LD",    doLd,    4, RegHi{.af},                Adr16{}         } // ok
+  jmpTable[0xFB] = {"EI",    doEi,    1, None{},                    None{}          } // ok
+  jmpTable[0xFE] = {"CP",    doCp,    2, RegHi{.af},                Imm8{}          } // ok
+  jmpTable[0xFF] = {"RST38", doCall,  4, Const{0x38},               None{}          } // ok
+
+  instrsAlt := []struct{name: str; handler: Handler}{
+    {"RLC", doRlc}, {"RRC", doRrc}, {"RL", doRl}, {"RR", doRr},
+    {"SLA", doSla}, {"SRA", doSra}, {"SWAP", doSwap}, {"SRL", doSrl},
+    {"BIT", doMkBit(0)}, {"BIT", doMkBit(1)}, {"BIT", doMkBit(2)}, {"BIT", doMkBit(3)}, 
+    {"BIT", doMkBit(4)}, {"BIT", doMkBit(5)}, {"BIT", doMkBit(6)}, {"BIT", doMkBit(7)}, 
+    {"RES", doMkRes(0)}, {"RES", doMkRes(1)}, {"RES", doMkRes(2)}, {"RES", doMkRes(3)}, 
+    {"RES", doMkRes(4)}, {"RES", doMkRes(5)}, {"RES", doMkRes(6)}, {"RES", doMkRes(7)}, 
+    {"SET", doMkSet(0)}, {"SET", doMkSet(1)}, {"SET", doMkSet(2)}, {"SET", doMkSet(3)}, 
+    {"SET", doMkSet(4)}, {"SET", doMkSet(5)}, {"SET", doMkSet(6)}, {"SET", doMkSet(7)}, 
+  }
+
+  for i, instr in instrsAlt {
+    for j, rec in order {
+      cyc := 1
+      if j == 6 {
+        cyc++
+      }
+      jmpTable2[i*8+j] = {instr.name, instr.handler, cyc, rec, None{}}
+    }
+  }
+
+  gb := new(Gameboy, {
+    rom: rom,
+    running: true,
+    jmpTable: jmpTable,
+    jmpTable2: jmpTable2
+  })
+
+  afReg = weak ^uint16(&gb.cpu.regs[REG_AF])
+  pcReg = weak ^uint16(&gb.cpu.regs[REG_PC])
+
+  pcReg^ = 0x100
+  gb.cpu.regs[REG_SP] = 0xFFFE
+
+  for i:=0; i<256; i++ {
+    gb.ppu.tileMapperA[i] = i
+  }
+
+  for i:=0; i<128; i++ {
+    gb.ppu.tileMapperB[i] = i+128
+  }
+  for i:=128; i<256; i++ {
+    gb.ppu.tileMapperB[i] = i-128
+  }
+
+  for i:=0; i<=0xFFFF; i++ {
+    r, w := mapMemRgn(i)
+
+    memMapR[i] = r
+    memMapW[i] = w
+  }
+
+  return gb
+}
+
+fn (gb: ^Gameboy) setJoy*(joy: uint8) {
+  mask := 0xFF
+
+  switch (gb.io_joy>>4)&3 {
+  case JOYSELECT_DPAD: mask = 0xF0
+  case JOYSELECT_BTNS: mask = 0x0F
+  case JOYSELECT_ALLS: mask = 0xFF
+  case JOYSELECT_NONE: mask = 0x00
+  }
+
+  if gb.joyData&mask != joy&mask {
+    gb.io_irq |= IF_JOY
+  }
+
+  gb.joyData = joy
+}
+
+fn readHeader*(rom: []uint8): Header {
+  title := ""
+
+  for i:=0x134; i<0x144; i++ {
+    title += char(rom[i])
+  }
+
+  return {
+    title:    title,
+    cartType: rom[0x147],
+    romSize:  rom[0x148],
+    ramSize:  rom[0x149],
+  }
+}
+
