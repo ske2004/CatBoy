@@ -22,6 +22,7 @@ var (
   font: font::Font
   frameNo: int
   data: []uint32
+  frametimeAvg: [100]real
 )
 
 fn init*() {
@@ -57,6 +58,7 @@ fn init*() {
   std::exitif(err)
   data = make([]uint32, 160*144)
 
+
   window::onFrame.register(|image, gb, gbFiber| {
     joyData := uint8(0)
     if input::isPressed(.z) { joyData |= gb::JOY_B }
@@ -72,17 +74,26 @@ fn init*() {
     t := std::clock()
     resume(gbFiber)
     t2 := std::clock()-t
+    frametimeAvg[frameNo%100] = t2
+
     image.setData(gb.ppu.screen, {160, 144})
     image.draw({s: {1, 1}})
+
+    avg := 0.0
+    for i, t in frametimeAvg {
+      avg += t
+    }
+    avg /= 100.0
     
-    // dbg::renderDebugInfo(font, 
-    //   {
-    //     "frametime": sprintf("%gs", t2),
-    //     "frameNo": frameNo,
-    //   },
-    //   false,
-    //   0.2
-    // )
+    dbg::renderDebugInfo(font, 
+      {
+        "frametime": sprintf("%gs", t2),
+        "frametimeAvg": sprintf("%gs", avg),
+        "frameNo": frameNo,
+      },
+      false,
+      0.2
+    )
 
     frameNo++
   })
